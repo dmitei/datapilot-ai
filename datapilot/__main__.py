@@ -1,0 +1,99 @@
+import argparse
+import asyncio
+import logging
+import os
+from pathlib import Path
+
+import asyncpg
+import httpx
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import Command
+from aiogram.types import BufferedInputFile, Message
+from aiogram.utils.token import TokenValidationError
+from dotenv import load_dotenv
+
+from .analytics import run_tool
+from .assistant import HELP, select_tool
+from .charts import render_png
+
+
+async def report_for(question, pool, client, model):
+    name, arguments = await select_tool(question, client, model)
+    return await run_tool(pool, name, arguments)
+
+
+async def serve_bot(token, pool, client, model):
+    dispatcher = Dispatcher()
+
+    @dispatcher.message(Command("start", "help"))
+    async def show_help(message: Message):
+        await message.answer(HELP)
+
+    @dispatcher.message(F.text)
+    async def handle_question(message: Message):
+        try:
+            report = await report_for(message.text, pool, client, model)
+            png = await asyncio.to_thread(render_png, report) if report.rows else None
+        except ValueError as error:
+            await message.answer(str(error))
+            return
+        except (asyncpg.PostgresError, OSError, TimeoutError):
+            await message.answer("База данных временно недоступна. Попробуй позже.")
+            return
+
+        await message.answer(report.as_text())
+        if png:
+            await message.answer_photo(BufferedInputFile(png, filename="report.png"))
+
+    async with Bot(token) as bot:
+        await dispatcher.start_polling(bot, close_bot_session=False,
+                                       tasks_concurrency_limit=8)
+
+
+async def main(args):
+    load_dotenv()
+    mode = os.getenv("LLM_MODE", "demo").strip().lower()
+    key = os.getenv("LLM_API_KEY", "").strip()
+    model = os.getenv("LLM_MODEL", "").strip()
+    token = os.getenv("BOT_TOKEN", "").strip()
+    if mode not in {"demo", "llm"}:
+        raise ValueError("LLM_MODE должен быть demo или llm.")
+    if mode == "llm" and not (key and model):
+        raise ValueError("Для режима llm укажи LLM_API_KEY и LLM_MODEL.")
+    if args.question is None and not token:
+        raise ValueError("Для Telegram укажи BOT_TOKEN в .env или передай вопрос в CLI.")
+
+    base_url = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")
+    database_url = os.getenv(
+        "DATABASE_URL", "postgresql://datapilot:datapilot@127.0.0.1:5433/datapilot"
+    )
+    async with httpx.AsyncClient(
+        base_url=base_url, headers={"Authorization": f"Bearer {key}"} if mode == "llm" else {},
+        timeout=15, trust_env=False,
+    ) as http, asyncpg.create_pool(
+        database_url, min_size=1, max_size=5, timeout=5, command_timeout=5
+    ) as pool:
+        client = http if mode == "llm" else None
+        if args.question is None:
+            await serve_bot(token, pool, client, model)
+            return
+        report = await report_for(args.question, pool, client, model)
+        print(report.as_text())
+        if report.rows:
+            args.png.write_bytes(await asyncio.to_thread(render_png, report))
+            print(f"График сохранён в {args.png}")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="DataPilot AI")
+    parser.add_argument("question", nargs="?", help="Вопрос для CLI, без Telegram")
+    parser.add_argument("--png", type=Path, default=Path("report.png"))
+    logging.basicConfig(level=logging.WARNING)
+    try:
+        asyncio.run(main(parser.parse_args()))
+    except TokenValidationError:
+        parser.exit(1, "Ошибка: проверь формат BOT_TOKEN.\n")
+    except ValueError as error:
+        parser.exit(1, f"Ошибка: {error}\n")
+    except (asyncpg.PostgresError, OSError, TimeoutError):
+        parser.exit(1, "Ошибка: проверь подключение к PostgreSQL и доступ к файлу PNG.\n")
