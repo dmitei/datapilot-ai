@@ -1,5 +1,3 @@
-BEGIN;
-
 CREATE TABLE IF NOT EXISTS companies (
     id integer PRIMARY KEY,
     name text NOT NULL,
@@ -14,5 +12,3 @@ CREATE TABLE IF NOT EXISTS monthly_finance (
     loan_balance_rub bigint NOT NULL CHECK (loan_balance_rub >= 0),
     PRIMARY KEY (company_id, month)
 );
-
-COMMIT;

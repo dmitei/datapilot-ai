@@ -1,5 +1,7 @@
 from dataclasses import dataclass
 
+from .storage import dataset_connection
+
 
 @dataclass(frozen=True)
 class Metric:
@@ -88,12 +90,11 @@ def validate_arguments(name: str, arguments: dict) -> tuple[int, int, int, bool]
     return year, first, last, show_total
 
 
-async def run_tool(pool, name: str, arguments: dict) -> Report:
+async def run_tool(pool, name: str, arguments: dict, user_id=None) -> Report:
     year, first, last, show_total = validate_arguments(name, arguments)
     metric = METRICS[name]
     params = (year, first, last) if metric.monthly else (year,)
-    async with pool.acquire() as connection:
-        async with connection.transaction(readonly=True):
-            records = await connection.fetch(metric.query, *params)
+    async with dataset_connection(pool, user_id) as connection:
+        records = await connection.fetch(metric.query, *params) if connection else []
     rows = [(row["label"], int(row["value"])) for row in records]
     return Report(metric, year, rows, first, last, show_total)

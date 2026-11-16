@@ -5,6 +5,8 @@ from io import StringIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from .storage import dataset_connection
+
 
 MAX_FILE_BYTES = 5 * 1024 * 1024
 MAX_ROWS = 20_000
@@ -13,10 +15,6 @@ CSV_COLUMNS = (
     "company_id", "name", "industry", "month",
     "revenue_rub", "expenses_rub", "loan_balance_rub",
 )
-SCHEMA = """CREATE TABLE IF NOT EXISTS dataset_import (
-    id boolean PRIMARY KEY CHECK (id),
-    imported_at timestamptz NOT NULL DEFAULT now()
-)"""
 
 
 def read_dataset(payload: bytes, extension: str):
@@ -132,27 +130,29 @@ def valid_label(value) -> bool:
     return isinstance(value, str) and bool(value.strip()) and len(value) <= 100 and value.isprintable()
 
 
-async def replace_dataset(pool, companies, finance):
-    async with pool.acquire() as connection:
-        async with connection.transaction():
-            await connection.execute("LOCK TABLE dataset_import IN EXCLUSIVE MODE")
-            await connection.execute("DELETE FROM monthly_finance")
-            await connection.execute("DELETE FROM companies")
-            await connection.copy_records_to_table(
-                "companies", records=companies, columns=("id", "name", "industry")
-            )
-            await connection.copy_records_to_table(
-                "monthly_finance", records=finance,
-                columns=("company_id", "month", "revenue_rub", "expenses_rub", "loan_balance_rub")
-            )
-            await connection.execute(
-                """INSERT INTO dataset_import (id) VALUES (TRUE)
-                   ON CONFLICT (id) DO UPDATE SET imported_at = now()"""
-            )
+async def replace_dataset(pool, companies, finance, user_id=None):
+    async with dataset_connection(pool, user_id, writing=True) as connection:
+        await connection.execute("LOCK TABLE dataset_import IN EXCLUSIVE MODE")
+        await connection.execute("DELETE FROM monthly_finance")
+        await connection.execute("DELETE FROM companies")
+        await connection.copy_records_to_table(
+            "companies", records=companies, columns=("id", "name", "industry")
+        )
+        await connection.copy_records_to_table(
+            "monthly_finance", records=finance,
+            columns=("company_id", "month", "revenue_rub", "expenses_rub", "loan_balance_rub")
+        )
+        await connection.execute(
+            """INSERT INTO dataset_import (id) VALUES (TRUE)
+               ON CONFLICT (id) DO UPDATE SET imported_at = now()"""
+        )
 
 
-async def latest_uploaded_year(pool):
-    return await pool.fetchval(
-        """SELECT EXTRACT(YEAR FROM max(month))::integer
-           FROM monthly_finance WHERE EXISTS (SELECT 1 FROM dataset_import)"""
-    )
+async def latest_uploaded_year(pool, user_id=None):
+    async with dataset_connection(pool, user_id) as connection:
+        if connection is None:
+            return None
+        return await connection.fetchval(
+            """SELECT EXTRACT(YEAR FROM max(month))::integer
+               FROM monthly_finance WHERE EXISTS (SELECT 1 FROM dataset_import)"""
+        )

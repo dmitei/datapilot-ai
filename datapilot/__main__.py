@@ -17,42 +17,30 @@ from dotenv import load_dotenv
 from .analytics import run_tool
 from .assistant import HELP, select_tool
 from .charts import render_png
-from .import_db import MAX_FILE_BYTES, SCHEMA, latest_uploaded_year, read_dataset, replace_dataset
+from .import_db import MAX_FILE_BYTES, latest_uploaded_year, read_dataset, replace_dataset
+from .storage import SCHEMA
 
 
-async def report_for(question, pool, client, model):
-    year = await latest_uploaded_year(pool)
+async def report_for(question, pool, client, model, user_id=None):
+    year = await latest_uploaded_year(pool, user_id)
     if year is None:
         raise ValueError("Данных пока нет. Отправь боту файл SQLite (.db) или CSV (.csv).")
     name, arguments = await select_tool(question, client, model, default_year=year)
-    return await run_tool(pool, name, arguments)
+    return await run_tool(pool, name, arguments, user_id)
 
 
-async def serve_bot(token, pool, client, model, owner_id):
+async def serve_bot(token, pool, client, model):
     dispatcher = Dispatcher()
-
-    def is_owner(message: Message) -> bool:
-        return (message.chat.type == "private" and message.from_user is not None
-                and message.from_user.id == owner_id)
-
-    @dispatcher.message(Command("id"), F.chat.type == "private")
-    async def show_id(message: Message):
-        if message.from_user is not None:
-            await message.answer(f"Твой Telegram ID: {message.from_user.id}")
 
     @dispatcher.message(Command("start", "help"), F.chat.type == "private")
     async def show_help(message: Message):
-        if is_owner(message):
-            await message.answer(HELP + "\n\nПришли .db или .csv как файл, чтобы загрузить или заменить данные.")
-        elif owner_id is None:
-            await message.answer("Для настройки доступа отправь /id и запиши число в BOT_OWNER_ID.")
-        else:
-            await message.answer("Отчёты и импорт доступны владельцу бота.")
+        await message.answer(
+            HELP + "\n\nПришли .db или .csv как файл. Каждый пользователь видит только свои данные."
+        )
 
     @dispatcher.message(F.document, F.chat.type == "private")
     async def handle_document(message: Message, bot: Bot):
-        if not is_owner(message):
-            await message.answer("Для загрузки файла настрой доступ через /start.")
+        if message.from_user is None:
             return
         document = message.document
         extension = Path(document.file_name or "").suffix.lower()
@@ -66,7 +54,7 @@ async def serve_bot(token, pool, client, model, owner_id):
             with BytesIO() as buffer:
                 await bot.download(document, destination=buffer, timeout=30)
                 companies, finance = await asyncio.to_thread(read_dataset, buffer.getvalue(), extension)
-            await replace_dataset(pool, companies, finance)
+            await replace_dataset(pool, companies, finance, message.from_user.id)
         except ValueError as error:
             await message.answer(str(error))
             return
@@ -80,10 +68,10 @@ async def serve_bot(token, pool, client, model, owner_id):
 
     @dispatcher.message(F.text, F.chat.type == "private")
     async def handle_question(message: Message):
-        if not is_owner(message):
+        if message.from_user is None:
             return
         try:
-            report = await report_for(message.text, pool, client, model)
+            report = await report_for(message.text, pool, client, model, message.from_user.id)
             png = await asyncio.to_thread(render_png, report) if report.rows else None
         except ValueError as error:
             await message.answer(str(error))
@@ -111,10 +99,6 @@ async def main(args):
         raise ValueError("LLM_MODE должен быть demo или llm.")
     if mode == "llm" and not (key and model):
         raise ValueError("Для режима llm укажи LLM_API_KEY и LLM_MODEL.")
-    raw_owner = os.getenv("BOT_OWNER_ID", "").strip()
-    if raw_owner and (not raw_owner.isascii() or not raw_owner.isdecimal() or int(raw_owner) <= 0):
-        raise ValueError("BOT_OWNER_ID должен быть числом из команды /id.")
-    owner_id = int(raw_owner) if raw_owner else None
     if args.question is None and args.import_db is None and not token:
         raise ValueError("Для Telegram укажи BOT_TOKEN в .env или передай вопрос в CLI.")
 
@@ -128,7 +112,8 @@ async def main(args):
     ) as http, asyncpg.create_pool(
         database_url, min_size=1, max_size=5, timeout=5, command_timeout=5
     ) as pool:
-        await pool.execute(SCHEMA)
+        if args.question is not None or args.import_db is not None:
+            await pool.execute(SCHEMA)
         if args.import_db is not None:
             with args.import_db.open("rb") as source:
                 companies, finance = await asyncio.to_thread(
@@ -139,7 +124,7 @@ async def main(args):
             return
         client = http if mode == "llm" else None
         if args.question is None:
-            await serve_bot(token, pool, client, model, owner_id)
+            await serve_bot(token, pool, client, model)
             return
         report = await report_for(args.question, pool, client, model)
         print(report.as_text())

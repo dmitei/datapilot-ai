@@ -10,7 +10,8 @@ import httpx
 from datapilot.analytics import METRICS, Report, run_tool
 from datapilot.assistant import select_tool
 from datapilot.charts import render_png
-from datapilot.import_db import SCHEMA, latest_uploaded_year, read_dataset, replace_dataset
+from datapilot.import_db import latest_uploaded_year, read_dataset, replace_dataset
+from datapilot.storage import SCHEMA, telegram_schema
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -116,6 +117,8 @@ class AnalyticsTests(unittest.IsolatedAsyncioTestCase):
     async def test_import_and_postgres_queries_for_both_years(self):
         url = os.environ["TEST_DATABASE_URL"]
         schema = "test_datapilot_" + uuid4().hex
+        first_user = uuid4().int % (2**62) + 1
+        second_user = first_user + 1
         admin = await asyncpg.connect(url)
         try:
             await admin.execute(f"CREATE SCHEMA {schema}")
@@ -123,9 +126,11 @@ class AnalyticsTests(unittest.IsolatedAsyncioTestCase):
                 url, min_size=1, max_size=2, server_settings={"search_path": schema}
             ) as pool:
                 await self.verify_import_and_reports(pool)
+                await self.verify_telegram_isolation(pool, first_user, second_user)
         finally:
             try:
-                await admin.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+                for name in (schema, telegram_schema(first_user), telegram_schema(second_user)):
+                    await admin.execute(f"DROP SCHEMA IF EXISTS {name} CASCADE")
             finally:
                 await admin.close()
 
@@ -166,3 +171,30 @@ class AnalyticsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await latest_uploaded_year(pool), 2026)
         report = await run_tool(pool, "monthly_revenue", {"year": 2026})
         self.assertEqual(report.rows, [("01", 2_500_000)])
+
+    async def verify_telegram_isolation(self, pool, first_user, second_user):
+        question = {"year": 2026}
+        first_csv = f"{CSV_HEADER}\n{CSV_ROW}\n"
+        second_csv = first_csv.replace("2500000", "7500000")
+        first_data = read_dataset(first_csv.encode(), ".csv")
+        second_data = read_dataset(second_csv.encode(), ".csv")
+
+        self.assertIsNone(await latest_uploaded_year(pool, first_user))
+        self.assertIsNone(await latest_uploaded_year(pool, second_user))
+        await replace_dataset(pool, *first_data, user_id=first_user)
+        self.assertIsNone(await latest_uploaded_year(pool, second_user))
+        report = await run_tool(pool, "monthly_revenue", question, second_user)
+        self.assertEqual(report.rows, [])
+        await replace_dataset(pool, *second_data, user_id=second_user)
+
+        report = await run_tool(pool, "monthly_revenue", question, first_user)
+        self.assertEqual(report.rows, [("01", 2_500_000)])
+        report = await run_tool(pool, "monthly_revenue", question, second_user)
+        self.assertEqual(report.rows, [("01", 7_500_000)])
+
+        sqlite_data = read_dataset(EXAMPLE_DB.read_bytes(), ".db")
+        await replace_dataset(pool, *sqlite_data, user_id=first_user)
+        self.assertEqual(await latest_uploaded_year(pool, first_user), 2025)
+        self.assertEqual(await latest_uploaded_year(pool, second_user), 2026)
+        report = await run_tool(pool, "monthly_revenue", question, second_user)
+        self.assertEqual(report.rows, [("01", 7_500_000)])
