@@ -10,11 +10,13 @@ import httpx
 from datapilot.analytics import METRICS, Report, run_tool
 from datapilot.assistant import select_tool
 from datapilot.charts import render_png
-from datapilot.import_db import SCHEMA, latest_uploaded_year, read_sqlite, replace_dataset
+from datapilot.import_db import SCHEMA, latest_uploaded_year, read_dataset, replace_dataset
 
 
 ROOT = Path(__file__).resolve().parents[1]
 EXAMPLE_DB = ROOT / "examples" / "example.db"
+CSV_HEADER = "company_id,name,industry,month,revenue_rub,expenses_rub,loan_balance_rub"
+CSV_ROW = "1,Вектор Софт,ИТ,2026-01-01,2500000,1800000,4000000"
 
 
 class RoutingTests(unittest.IsolatedAsyncioTestCase):
@@ -90,10 +92,25 @@ class AnalyticsTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(render_png(report).startswith(b"\x89PNG\r\n\x1a\n"))
 
     def test_reads_sqlite_example_and_rejects_invalid_file(self):
-        companies, rows = read_sqlite(EXAMPLE_DB.read_bytes())
+        companies, rows = read_dataset(EXAMPLE_DB.read_bytes(), ".db")
         self.assertEqual((len(companies), len(rows)), (6, 144))
         with self.assertRaisesRegex(ValueError, "SQLite"):
-            read_sqlite(b"not a database")
+            read_dataset(b"not a database", ".db")
+
+    def test_reads_csv_with_both_delimiters_and_utf8_bom(self):
+        csv_text = f"{CSV_HEADER}\n{CSV_ROW}\n"
+        for delimiter in (",", ";"):
+            with self.subTest(delimiter=delimiter):
+                payload = csv_text.replace(",", delimiter).encode("utf-8-sig")
+                companies, rows = read_dataset(payload, ".csv")
+                self.assertEqual(companies, [(1, "Вектор Софт", "ИТ")])
+                self.assertEqual(rows[0][1].isoformat(), "2026-01-01")
+
+    def test_rejects_inconsistent_csv_rows(self):
+        for rows in (f"{CSV_ROW}\n{CSV_ROW}", CSV_ROW.replace("2500000", "abc"),
+                     f"{CSV_ROW}\n{CSV_ROW.replace('Вектор Софт', 'Другая').replace('01-01', '02-01')}"):
+            with self.subTest(rows=rows), self.assertRaises(ValueError):
+                read_dataset(f"{CSV_HEADER}\n{rows}\n".encode(), ".csv")
 
     @unittest.skipUnless(os.getenv("TEST_DATABASE_URL"), "Укажи TEST_DATABASE_URL для проверки PostgreSQL")
     async def test_import_and_postgres_queries_for_both_years(self):
@@ -117,7 +134,7 @@ class AnalyticsTests(unittest.IsolatedAsyncioTestCase):
         await pool.execute(SCHEMA)
         self.assertIsNone(await latest_uploaded_year(pool))
         self.assertEqual(await pool.fetchval("SELECT count(*) FROM companies"), 0)
-        companies, rows = read_sqlite(EXAMPLE_DB.read_bytes())
+        companies, rows = read_dataset(EXAMPLE_DB.read_bytes(), ".db")
         await replace_dataset(pool, companies, rows)
         self.assertEqual(await latest_uploaded_year(pool), 2025)
         with self.assertRaises(asyncpg.ForeignKeyViolationError):
@@ -143,6 +160,9 @@ class AnalyticsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([label for label, _ in first_half.rows],
                          ["01", "02", "03", "04", "05", "06"])
         self.assertIn("Итого за период — 196 780 000 ₽", first_half.as_text())
-        await replace_dataset(pool, companies[:1], rows[:1])
+        csv_dataset = read_dataset(f"{CSV_HEADER}\n{CSV_ROW}\n".encode(), ".csv")
+        await replace_dataset(pool, *csv_dataset)
         self.assertEqual(await pool.fetchval("SELECT count(*) FROM monthly_finance"), 1)
-        self.assertEqual(await latest_uploaded_year(pool), 2024)
+        self.assertEqual(await latest_uploaded_year(pool), 2026)
+        report = await run_tool(pool, "monthly_revenue", {"year": 2026})
+        self.assertEqual(report.rows, [("01", 2_500_000)])

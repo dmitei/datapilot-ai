@@ -17,13 +17,13 @@ from dotenv import load_dotenv
 from .analytics import run_tool
 from .assistant import HELP, select_tool
 from .charts import render_png
-from .import_db import MAX_FILE_BYTES, SCHEMA, latest_uploaded_year, read_sqlite, replace_dataset
+from .import_db import MAX_FILE_BYTES, SCHEMA, latest_uploaded_year, read_dataset, replace_dataset
 
 
 async def report_for(question, pool, client, model):
     year = await latest_uploaded_year(pool)
     if year is None:
-        raise ValueError("Данных пока нет. Отправь боту файл SQLite (.db).")
+        raise ValueError("Данных пока нет. Отправь боту файл SQLite (.db) или CSV (.csv).")
     name, arguments = await select_tool(question, client, model, default_year=year)
     return await run_tool(pool, name, arguments)
 
@@ -43,7 +43,7 @@ async def serve_bot(token, pool, client, model, owner_id):
     @dispatcher.message(Command("start", "help"), F.chat.type == "private")
     async def show_help(message: Message):
         if is_owner(message):
-            await message.answer(HELP + "\n\nПришли .db как файл, чтобы загрузить или заменить данные.")
+            await message.answer(HELP + "\n\nПришли .db или .csv как файл, чтобы загрузить или заменить данные.")
         elif owner_id is None:
             await message.answer("Для настройки доступа отправь /id и запиши число в BOT_OWNER_ID.")
         else:
@@ -55,8 +55,9 @@ async def serve_bot(token, pool, client, model, owner_id):
             await message.answer("Для загрузки файла настрой доступ через /start.")
             return
         document = message.document
-        if Path(document.file_name or "").suffix.lower() != ".db":
-            await message.answer("Пришли SQLite-базу с расширением .db.")
+        extension = Path(document.file_name or "").suffix.lower()
+        if extension not in {".db", ".csv"}:
+            await message.answer("Пришли файл SQLite (.db) или CSV (.csv).")
             return
         if document.file_size is None or not 0 < document.file_size <= MAX_FILE_BYTES:
             await message.answer("Файл должен быть размером до 5 МБ.")
@@ -64,7 +65,7 @@ async def serve_bot(token, pool, client, model, owner_id):
         try:
             with BytesIO() as buffer:
                 await bot.download(document, destination=buffer, timeout=30)
-                companies, finance = await asyncio.to_thread(read_sqlite, buffer.getvalue())
+                companies, finance = await asyncio.to_thread(read_dataset, buffer.getvalue(), extension)
             await replace_dataset(pool, companies, finance)
         except ValueError as error:
             await message.answer(str(error))
@@ -130,7 +131,9 @@ async def main(args):
         await pool.execute(SCHEMA)
         if args.import_db is not None:
             with args.import_db.open("rb") as source:
-                companies, finance = await asyncio.to_thread(read_sqlite, source.read(MAX_FILE_BYTES + 1))
+                companies, finance = await asyncio.to_thread(
+                    read_dataset, source.read(MAX_FILE_BYTES + 1), args.import_db.suffix.lower()
+                )
             await replace_dataset(pool, companies, finance)
             print(f"База загружена. Компаний: {len(companies)}, строк: {len(finance)}.")
             return
@@ -148,7 +151,7 @@ async def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="DataPilot AI")
     parser.add_argument("question", nargs="?", help="Вопрос для CLI, без Telegram")
-    parser.add_argument("--import-db", type=Path, help="Загрузить локальный SQLite-файл")
+    parser.add_argument("--import-db", type=Path, help="Загрузить локальный файл SQLite или CSV")
     parser.add_argument("--png", type=Path, default=Path("report.png"))
     logging.basicConfig(level=logging.WARNING)
     try:

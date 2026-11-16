@@ -1,5 +1,7 @@
+import csv
 import sqlite3
 from datetime import date
+from io import StringIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -7,15 +9,27 @@ from tempfile import TemporaryDirectory
 MAX_FILE_BYTES = 5 * 1024 * 1024
 MAX_ROWS = 20_000
 MAX_AMOUNT = 10**12
+CSV_COLUMNS = (
+    "company_id", "name", "industry", "month",
+    "revenue_rub", "expenses_rub", "loan_balance_rub",
+)
 SCHEMA = """CREATE TABLE IF NOT EXISTS dataset_import (
     id boolean PRIMARY KEY CHECK (id),
     imported_at timestamptz NOT NULL DEFAULT now()
 )"""
 
 
-def read_sqlite(payload: bytes):
+def read_dataset(payload: bytes, extension: str):
     if not 0 < len(payload) <= MAX_FILE_BYTES:
         raise ValueError("Размер файла должен быть от 1 байта до 5 МБ.")
+    if extension == ".csv":
+        return read_csv(payload)
+    if extension == ".db":
+        return read_sqlite(payload)
+    raise ValueError("Пришли файл SQLite (.db) или CSV (.csv).")
+
+
+def read_sqlite(payload: bytes):
     if not payload.startswith(b"SQLite format 3\x00"):
         raise ValueError("Файл должен быть базой SQLite.")
 
@@ -43,6 +57,46 @@ def read_sqlite(payload: bytes):
     except sqlite3.Error:
         raise ValueError("Не удалось прочитать таблицы SQLite. Сверь столбцы с README.") from None
 
+    return validate_dataset(companies, finance)
+
+
+def read_csv(payload: bytes):
+    try:
+        with StringIO(payload.decode("utf-8-sig"), newline="") as stream:
+            header = stream.readline()
+            delimiter = ";" if header.count(";") > header.count(",") else ","
+            stream.seek(0)
+            reader = csv.DictReader(stream, delimiter=delimiter, strict=True)
+            fields = reader.fieldnames or []
+            if len(fields) != len(CSV_COLUMNS) or set(fields) != set(CSV_COLUMNS):
+                raise ValueError("Проверь заголовки CSV по примеру в README.")
+
+            companies = {}
+            finance = []
+            for row in reader:
+                if len(finance) == MAX_ROWS:
+                    raise ValueError("В CSV должно быть не больше 20 000 строк данных.")
+                if None in row or any(value is None for value in row.values()):
+                    raise ValueError(f"Строка CSV {reader.line_num}: проверь число полей.")
+                try:
+                    company_id = int(row["company_id"])
+                    amounts = tuple(int(row[column]) for column in CSV_COLUMNS[4:])
+                except ValueError:
+                    raise ValueError(
+                        f"Строка CSV {reader.line_num}: ID и суммы должны быть целыми числами."
+                    ) from None
+
+                company = (company_id, row["name"].strip(), row["industry"].strip())
+                if companies.setdefault(company_id, company) != company:
+                    raise ValueError(f"Строка CSV {reader.line_num}: название или отрасль ID изменились.")
+                finance.append((company_id, row["month"].strip(), *amounts))
+    except (UnicodeError, csv.Error):
+        raise ValueError("Не удалось прочитать CSV. Сохрани файл в UTF-8 и проверь разделитель.") from None
+
+    return validate_dataset(list(companies.values()), finance)
+
+
+def validate_dataset(companies, finance):
     if not companies or not finance or max(len(companies), len(finance)) > MAX_ROWS:
         raise ValueError("В каждой таблице должно быть от 1 до 20 000 строк.")
 

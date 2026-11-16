@@ -7,7 +7,7 @@ from .analytics import METRICS, validate_arguments
 
 
 HELP = (
-    "DataPilot AI · отчёты по загруженной базе SQLite.\n"
+    "DataPilot AI · отчёты по загруженному файлу SQLite или CSV.\n"
     "По умолчанию используется последний год в базе.\n\n"
     "/revenue 2025 — выручка\n"
     "/expenses 2025 — расходы\n"
