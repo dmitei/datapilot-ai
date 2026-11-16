@@ -27,7 +27,7 @@ def render_png(report: Report) -> bytes:
             axes.invert_yaxis()
             axes.set_xlabel("млн ₽")
             axes.grid(axis="x", alpha=0.25)
-        axes.set_title(f"{report.metric.title} · {report.year}")
+        axes.set_title(f"{report.metric.title} · {report.period}")
         with BytesIO() as buffer:
             canvas.print_png(buffer)
             return buffer.getvalue()
